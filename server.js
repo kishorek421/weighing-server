@@ -5,7 +5,7 @@ import express from "express";
 import mongoose from "mongoose";
 
 // ==== MongoDB Setup ====
-const MONGO_URI = process.env.MONGO_URI || "mongodb://admin:admin@127.0.0.1:27017/admin?authSource=admin";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://bellwethersriram_db_user:Hrcf79M3WUAjjp0I@weighingmachine.agebd8s.mongodb.net/";
 await mongoose.connect(MONGO_URI);
 
 const deviceSchema = new mongoose.Schema({
