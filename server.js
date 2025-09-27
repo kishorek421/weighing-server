@@ -7,6 +7,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 // ==== Basic setup ====
 const __filename = fileURLToPath(import.meta.url);
@@ -52,7 +53,41 @@ app.get("/", (req, res) => {
   res.send("✅ WebSocket + HTTP server running");
 });
 
-// API: Get device config
+// In upload handler change to compute sha256:
+app.post("/firmware/upload", upload.single("firmware"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded under 'firmware'" });
+
+    // compute SHA256 of uploaded file
+    const filePath = path.join(FIRMWARE_DIR, req.file.filename);
+    const hash = crypto.createHash("sha256");
+    const rs = fs.createReadStream(filePath);
+    await new Promise((resolve, reject) => {
+      rs.on("data", (chunk) => hash.update(chunk));
+      rs.on("end", resolve);
+      rs.on("error", reject);
+    });
+    const sha256 = hash.digest("hex");
+
+    // Build a URL for download using request protocol & host
+    const protocol = req.protocol; // will be http in dev, https behind proxy if configured
+    const host = req.get("host");
+    const url = `${protocol}://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
+
+    // Optionally store a global record or return the sha to caller
+    res.json({
+      filename: req.file.filename,
+      size: req.file.size,
+      url,
+      sha256
+    });
+  } catch (err) {
+    console.error("❌ Firmware upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// In GET /config/:deviceId, include firmwareSha256 and firmwareSize fields
 app.get("/config/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -71,6 +106,8 @@ app.get("/config/:deviceId", async (req, res) => {
       firmwareUrl: config.firmwareUrl || null,
       firmwareVersion: config.firmwareVersion || null,
       firmwareUploadedAt: config.firmwareUploadedAt || null,
+      firmwareSha256: config.firmwareSha256 || null,
+      firmwareSize: config.firmwareSize || null
     });
   } catch (err) {
     console.error("❌ Error fetching config:", err);
@@ -78,61 +115,11 @@ app.get("/config/:deviceId", async (req, res) => {
   }
 });
 
-// ==== Multer upload for firmware binaries ====
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, FIRMWARE_DIR),
-  filename: (req, file, cb) => {
-    // keep original or use timestamped unique name
-    const timestamp = Date.now();
-    // sanitize filename
-    const base = path.basename(file.originalname).replace(/\s+/g, "_");
-    const name = `${timestamp}-${base}`;
-    cb(null, name);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB limit (adjust)
-});
-
-// Upload firmware file => returns accessible URL
-app.post("/firmware/upload", upload.single("firmware"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded under 'firmware'" });
-
-    // Build a URL for download. Use request host/protocol when available.
-    const protocol = req.protocol;
-    const host = req.get("host"); // may include port
-    // const url = `${protocol}://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
-
-    // res.json({
-    //   filename: req.file.filename,
-    //   size: req.file.size,
-    //   url,
-    // });
-    const url = `https://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
-    res.json({ filename: req.file.filename, size: req.file.size, url });
-  } catch (err) {
-    console.error("❌ Firmware upload error:", err);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// ==== Set firmware for a device and optionally broadcast OTA command ====
-/*
- Request body example:
- {
-   "firmwareUrl": "https://your-domain/firmwares/1234-abcd.bin",
-   "firmwareVersion": "v1.2.3",
-   "broadcast": "all"         // "all" or "device" (default: "device")
- }
- If broadcast === "all", server will send {"event":"ota","url": firmwareUrl} to all ws clients.
- If broadcast === "device", server will send to clients whose deviceId matches.
-*/
+// Update the /config/:deviceId/firmware endpoint to accept sha and size (optional)
 app.post("/config/:deviceId/firmware", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { firmwareUrl, firmwareVersion, broadcast } = req.body;
+    const { firmwareUrl, firmwareVersion, broadcast, firmwareSha256, firmwareSize } = req.body;
 
     if (!firmwareUrl) {
       return res.status(400).json({ error: "firmwareUrl required in body" });
@@ -143,11 +130,19 @@ app.post("/config/:deviceId/firmware", async (req, res) => {
 
     config.firmwareUrl = firmwareUrl;
     if (firmwareVersion) config.firmwareVersion = firmwareVersion;
+    if (firmwareSha256) config.firmwareSha256 = firmwareSha256;
+    if (firmwareSize) config.firmwareSize = firmwareSize;
     config.firmwareUploadedAt = new Date();
     await config.save();
 
     // broadcast OTA message via WebSocket server
-    const otaMsg = JSON.stringify({ event: "ota", url: firmwareUrl, version: firmwareVersion || null, deviceId });
+    const otaMsg = JSON.stringify({
+      event: "ota",
+      url: firmwareUrl,
+      version: firmwareVersion || null,
+      firmwareSha256: firmwareSha256 || null,
+      deviceId
+    });
 
     if (broadcast === "all") {
       // send to all connected clients
@@ -160,8 +155,6 @@ app.post("/config/:deviceId/firmware", async (req, res) => {
       wss.clients.forEach((client) => {
         try {
           if (client.readyState !== client.OPEN) return;
-          // We expect each client to send a hello with deviceId after connect.
-          // We store deviceId on the ws object in 'connection' handler below.
           if (client.deviceId && client.deviceId === deviceId) {
             client.send(otaMsg);
             console.log(`🔔 Sent OTA to ${deviceId}`);
@@ -172,7 +165,7 @@ app.post("/config/:deviceId/firmware", async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, firmwareUrl, firmwareVersion });
+    return res.json({ ok: true, firmwareUrl, firmwareVersion, firmwareSha256 });
   } catch (err) {
     console.error("❌ Error setting firmware:", err);
     res.status(500).json({ error: "Failed to set firmware" });
