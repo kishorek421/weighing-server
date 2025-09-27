@@ -179,58 +179,167 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws, req) => {
   console.log("New WS client");
 
+  ws.isAlive = true;
+
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
   ws.on("message", async (raw) => {
     const message = raw.toString();
 
-    // Try parse hello with deviceId / version
+    // Try parse JSON
     let parsed;
     try {
       parsed = JSON.parse(message);
     } catch (e) {
-      // Not JSON – ignore or handle as plain text
+      // Not JSON – ignore or handle as plain text if you want
+      console.warn("Received non-JSON WS message, ignoring.");
       return;
     }
 
     try {
+      // ----- HELLO from device (register deviceId + version) -----
       if (parsed.event === "hello" && parsed.deviceId) {
-        // Basic sanitization
         const deviceId = String(parsed.deviceId).trim();
         const deviceVersion = parsed.version ? String(parsed.version).trim() : null;
-
         ws.deviceId = deviceId;
-        console.log("Registered ws.deviceId =", ws.deviceId, "version:", deviceVersion);
+        console.log("Registered ws.deviceId =", deviceId, "version:", deviceVersion);
 
-        // Only attempt clearing if server has an assigned firmwareVersion for this device
+        // Look up DB config for this device
         const cfg = await DeviceConfig.findOne({ deviceId });
-        if (cfg && cfg.firmwareVersion && deviceVersion) {
-          // Compare versions (strict equality). Optionally compare SHA as well.
-          if (cfg.firmwareVersion === deviceVersion) {
-            // Atomically clear the assignment and mark appliedAt (safer)
-            const update = {
-              $set: { firmwareUrl: "", firmwareSha256: "" },
-              $unset: { /* nothing for now */ }
-            };
-            await DeviceConfig.findOneAndUpdate({ deviceId, firmwareVersion: cfg.firmwareVersion }, update);
-            console.log(`Cleared assigned firmware for ${deviceId} (version ${deviceVersion})`);
 
-            // Send explicit ack to device so it knows server recorded the applied version
-            const ack = { event: "ota_ack", deviceId, version: deviceVersion };
-            if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(ack));
+        // If device already running the assigned version, clear assignment
+        if (cfg && cfg.firmwareVersion && deviceVersion) {
+          if (cfg.firmwareVersion === deviceVersion) {
+            await DeviceConfig.findOneAndUpdate(
+              { deviceId, firmwareVersion: cfg.firmwareVersion },
+              { $set: { firmwareUrl: "", firmwareSha256: "" } }
+            );
+            console.log(`Cleared assigned firmware for ${deviceId} (version ${deviceVersion})`);
+            // acknowledge to device
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ event: "ota_ack", deviceId, version: deviceVersion }));
+            }
           }
         }
+
+        // If DB has a firmwareUrl assigned (and it's not the same version), notify the device about OTA
+        if (cfg && cfg.firmwareUrl && cfg.firmwareUrl.length > 0) {
+          // Only send ota message if device is not already running that version (defensive)
+          if (!cfg.firmwareVersion || cfg.firmwareVersion !== deviceVersion) {
+            const otaMsg = {
+              event: "ota",
+              url: cfg.firmwareUrl,
+              version: cfg.firmwareVersion || null,
+              firmwareSha256: cfg.firmwareSha256 || null,
+              deviceId
+            };
+            try {
+              ws.send(JSON.stringify(otaMsg));
+              console.log(`Notified ${deviceId} about firmware: ${cfg.firmwareUrl}`);
+            } catch (e) {
+              console.warn("Failed to send ota message to device:", e && e.message);
+            }
+          }
+        }
+
+        // Optionally: send current config to device
+        if (cfg) {
+          const cfgMsg = {
+            event: "config",
+            deviceId,
+            secondsToRead: cfg.secondsToRead,
+            threshold: cfg.threshold,
+            enabled: cfg.enabled,
+          };
+          try {
+            ws.send(JSON.stringify(cfgMsg));
+          } catch (e) { /* ignore send errors */ }
+        }
+
+        return; // done with hello handling
       }
 
-      // Optional: handle other events (cfg, ota_ack from device, etc.)
-      // Example: if device sends ota_ack you can also clear assignment here.
+      // ----- OTA acknowledgement from device -----
+      if (parsed.event === "ota_ack" && parsed.deviceId && parsed.version) {
+        const deviceId = String(parsed.deviceId).trim();
+        const ver = String(parsed.version).trim();
+        console.log(`Received ota_ack from ${deviceId} version ${ver}`);
 
-      // If you still want to broadcast device telemetry/messages to other clients, do it explicitly:
-      if (parsed.event && parsed.event === "telemetry") {
-        const broadcastMsg = JSON.stringify(parsed); // or sanitize fields first
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === client.OPEN) client.send(broadcastMsg);
+        // Record that device applied the firmware: clear the fw_url and set firmwareVersion (and appliedAt if needed)
+        await DeviceConfig.findOneAndUpdate({ deviceId }, {
+          $set: {
+            firmwareVersion: ver,
+            firmwareSha256: parsed.sha || parsed.firmwareSha256 || "",
+            firmwareUploadedAt: new Date()
+          },
+          $unset: { firmwareUrl: "" }
         });
+
+        return;
       }
 
+      // ----- Telemetry: device sends JSON containing deviceId and numeric weight (weight/kg/grams) -----
+      const hasDeviceId = parsed.deviceId && typeof parsed.deviceId === "string";
+      const hasWeight =
+        typeof parsed.weight === "number" ||
+        typeof parsed.kg === "number" ||
+        typeof parsed.grams === "number";
+
+      if (hasDeviceId && hasWeight) {
+        // Normalize shape to keep consistent broadcasts
+        const deviceId = String(parsed.deviceId).trim();
+        let weightVal;
+        if (typeof parsed.weight === "number") weightVal = parsed.weight;
+        else if (typeof parsed.kg === "number") weightVal = parsed.kg;
+        else weightVal = parsed.grams / 1000.0;
+
+        const telemetry = {
+          event: "telemetry",
+          deviceId,
+          weight: Number(weightVal),
+          timestamp: parsed.timestamp || Date.now()
+        };
+
+        // Broadcast telemetry to all other clients (dashboards) — do not send back to origin
+        wss.clients.forEach((client) => {
+          try {
+            if (client !== ws && client.readyState === client.OPEN) {
+              client.send(JSON.stringify(telemetry));
+            }
+          } catch (e) {
+            // ignore send errors per-client
+          }
+        });
+
+        // Optionally: you can store last-seen time in DB, but keep it lightweight here
+        console.log(`Telem from ${deviceId}: ${telemetry.weight} kg`);
+
+        return;
+      }
+
+      // ----- Other events (cfg request, ping, etc.) -----
+      if (parsed.event === "cfg" && parsed.deviceId) {
+        // client asked for config refresh for a deviceId
+        const cfg = await DeviceConfig.findOne({ deviceId: parsed.deviceId });
+        if (cfg && ws.readyState === ws.OPEN) {
+          const cfgMsg = {
+            event: "config",
+            deviceId: cfg.deviceId,
+            secondsToRead: cfg.secondsToRead,
+            threshold: cfg.threshold,
+            enabled: cfg.enabled,
+            firmwareUrl: cfg.firmwareUrl || null,
+            firmwareVersion: cfg.firmwareVersion || null,
+            firmwareSha256: cfg.firmwareSha256 || null
+          };
+          ws.send(JSON.stringify(cfgMsg));
+        }
+        return;
+      }
+
+      // Other unhandled JSON events fall-through (you could broadcast or ignore)
     } catch (err) {
       console.error("WS message handler error:", err);
     }
@@ -244,7 +353,6 @@ wss.on("connection", (ws, req) => {
     console.warn("WS client error:", err && err.message);
   });
 });
-
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
