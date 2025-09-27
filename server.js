@@ -103,13 +103,15 @@ app.post("/firmware/upload", upload.single("firmware"), async (req, res) => {
     // Build a URL for download. Use request host/protocol when available.
     const protocol = req.protocol;
     const host = req.get("host"); // may include port
-    const url = `${protocol}://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
+    // const url = `${protocol}://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
 
-    res.json({
-      filename: req.file.filename,
-      size: req.file.size,
-      url,
-    });
+    // res.json({
+    //   filename: req.file.filename,
+    //   size: req.file.size,
+    //   url,
+    // });
+    const url = `https://${host}/firmwares/${encodeURIComponent(req.file.filename)}`;
+    res.json({ filename: req.file.filename, size: req.file.size, url });
   } catch (err) {
     console.error("❌ Firmware upload error:", err);
     res.status(500).json({ error: "Upload failed" });

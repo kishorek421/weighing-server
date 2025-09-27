@@ -15,6 +15,9 @@
 #include <WebSocketsClient.h>
 #include <HX711.h>
 
+WiFiClientSecure *otaSecureClient = nullptr; // for https requests (allocated inside function)
+HTTPClient otaHttp;      
+
 // ---------------- WIFI CONFIG ----------------
 const char* ssid = "DK";
 const char* password = "yourname";
@@ -31,7 +34,7 @@ const char* http_host_base = "https://weighing-server.onrender.com";  // used fo
 #define SCK 4  // HX711 Clock pin (SCK)
 HX711 scale;
 
-float calibration_factor = 13.40335;  // initial guess — re-calibrate on device
+float calibration_factor = -13.40335;  // initial guess — re-calibrate on device
 
 // ---------------- GLOBALS ----------------
 WebSocketsClient webSocket;
@@ -59,8 +62,12 @@ String generateDeviceId() {
   return "XYID-X3G-V2-AA(" + String(macStr) + ")";
 }
 
-// ---- Helper: perform HTTP OTA given a URL ----
-bool performHttpOTA(const String &firmwareUrl) {
+
+
+#define MAX_REDIRECTS 5
+#define OTA_READ_TIMEOUT_MS 8000  // wait up to 8s between data bursts
+
+bool performHttpOTA(String firmwareUrl) {
   Serial.println("Starting OTA from: " + firmwareUrl);
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -68,67 +75,169 @@ bool performHttpOTA(const String &firmwareUrl) {
     return false;
   }
 
-  HTTPClient http;
+  #ifdef ESP32
+  Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+  #endif
 
-  // Note: If you need strict TLS, replace the next line with:
-  // WiFiClientSecure client;
-  // client.setInsecure(); // or setFingerprint(...)
-  // http.begin(client, firmwareUrl);
-  http.begin(firmwareUrl);
+  String url = firmwareUrl;
+  int redirectCount = 0;
+  int httpCode = -1;
 
-  int httpCode = http.GET();
+  // follow redirects (http / https)
+  while (redirectCount < MAX_REDIRECTS) {
+    // clean previous client if any
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+
+    if (url.startsWith("https://")) {
+      otaSecureClient = new WiFiClientSecure();
+      otaSecureClient->setInsecure(); // NOTE: replace with cert pinning in production
+      if (!otaHttp.begin(*otaSecureClient, url)) {
+        Serial.println("otaHttp.begin(https) failed");
+        if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+        return false;
+      }
+    } else {
+      if (!otaHttp.begin(url)) {
+        Serial.println("otaHttp.begin(http) failed");
+        return false;
+      }
+    }
+
+    otaHttp.setTimeout(20000); // 20s timeout for slower connections
+    Serial.println("HTTP GET -> " + url);
+    httpCode = otaHttp.GET();
+    Serial.printf("HTTP code: %d\n", httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      break; // good
+    } else if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
+               httpCode == HTTP_CODE_SEE_OTHER || httpCode == 307 || httpCode == 308) {
+      String newLocation = otaHttp.header("Location");
+      Serial.println("Redirected to: " + newLocation);
+      otaHttp.end();
+      if (newLocation.length() == 0) {
+        Serial.println("Redirect without Location header - aborting");
+        if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+        return false;
+      }
+      url = newLocation;
+      redirectCount++;
+      continue;
+    } else {
+      Serial.printf("OTA HTTP GET failed, code=%d\n", httpCode);
+      otaHttp.end();
+      if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+      return false;
+    }
+  } // redirect loop
+
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("OTA HTTP GET failed, code=%d\n", httpCode);
-    http.end();
+    Serial.println("Too many redirects or final GET failed.");
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
 
-  int contentLength = http.getSize();
-  String contentType = http.header("Content-Type");
-  Serial.printf("OTA: contentLength=%d, contentType=%s\n", contentLength, contentType.c_str());
-
+  int contentLength = otaHttp.getSize();
+  Serial.printf("OTA: contentLength=%d\n", contentLength);
   if (contentLength <= 0) {
-    Serial.println("Content-Length not provided or zero — cannot OTA (needs fixed length).");
-    http.end();
+    Serial.println("Content-Length missing/zero — aborting OTA.");
+    otaHttp.end();
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
 
-  // get stream for writing to Update
-  WiFiClient * stream = http.getStreamPtr();
-
-  if (!Update.begin(contentLength)) {
-    Serial.println("Not enough space to begin OTA");
-    http.end();
+  // prepare Update
+  if (!Update.begin((uint32_t)contentLength)) {
+    Serial.printf("Update.begin failed: %s\n", Update.errorString());
+    otaHttp.end();
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
 
-  size_t written = Update.writeStream(*stream);
+  WiFiClient * stream = otaHttp.getStreamPtr();
+  const size_t BUFSZ = 512;
+  uint8_t buff[BUFSZ];
+  size_t written = 0;
+  unsigned long lastRead = millis();
 
+  Serial.println("Receiving firmware...");
+
+  while (written < (size_t)contentLength) {
+    int avail = stream->available();
+    if (avail <= 0) {
+      if (millis() - lastRead > OTA_READ_TIMEOUT_MS) {
+        Serial.println("Timeout waiting for stream data — aborting OTA");
+        break;
+      }
+      delay(5);
+      continue;
+    }
+
+    int toRead = avail;
+    if (toRead > (int)BUFSZ) toRead = BUFSZ;
+    int r = stream->readBytes(buff, toRead);
+    if (r <= 0) {
+      Serial.printf("stream read returned %d — aborting\n", r);
+      break;
+    }
+
+    // write with small retries
+    size_t w = 0;
+    const int MAX_WRITE_RETRIES = 2;
+    int attempt;
+    for (attempt = 0; attempt <= MAX_WRITE_RETRIES; ++attempt) {
+      w = Update.write(buff, r);
+      if (w == (size_t)r) break;
+      Serial.printf("Attempt %d: Update.write returned %u (expected %d)\n", attempt+1, (unsigned)w, r);
+      Serial.printf("Update.errorString(): %s\n", Update.errorString());
+      delay(50);
+    }
+
+    if (w != (size_t)r) {
+      Serial.printf("Write mismatch after retries: wrote %u expected %d — aborting OTA\n", (unsigned)w, r);
+      Serial.printf("Final Update.errorString(): %s\n", Update.errorString());
+      Update.abort();
+      otaHttp.end();
+      if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+      return false;
+    }
+
+    written += w;
+    lastRead = millis();
+    Serial.printf("OTA progress: %u/%d bytes (%.1f%%)\n", (unsigned)written, contentLength, (written*100.0)/contentLength);
+  }
+
+  // final checks
   if (written != (size_t)contentLength) {
-    Serial.printf("OTA written size mismatch (%u != %d)\n", (unsigned)written, contentLength);
+    Serial.printf("OTA written size mismatch (%u != %d) — aborting\n", (unsigned)written, contentLength);
     Update.abort();
-    http.end();
+    otaHttp.end();
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
 
   if (!Update.end()) {
-    Serial.printf("OTA failed finishing: %s\n", Update.errorString());
-    http.end();
+    Serial.printf("Update.end() failed: %s\n", Update.errorString());
+    otaHttp.end();
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
 
-  if (Update.isFinished()) {
-    Serial.println("OTA Success — restarting");
-    http.end();
-    delay(100);
-    ESP.restart();
-    return true; // won't reach, but for completeness
-  } else {
-    Serial.println("OTA not finished? unknown error");
-    http.end();
+  if (!Update.isFinished()) {
+    Serial.println("Update not finished — aborting");
+    otaHttp.end();
+    if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
     return false;
   }
+
+  Serial.println("OTA complete — restarting");
+  otaHttp.end();
+  if (otaSecureClient) { delete otaSecureClient; otaSecureClient = nullptr; }
+  delay(100);
+  ESP.restart();
+  return true;
 }
+
 
 // ---- Fetch Config from Server ----
 // Server response example expected:
