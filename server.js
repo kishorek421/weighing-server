@@ -187,14 +187,21 @@ wss.on("connection", (ws, req) => {
       if (parsed.event === "hello" && parsed.deviceId) {
         ws.deviceId = parsed.deviceId;
         console.log("Registered ws.deviceId =", ws.deviceId);
+        const deviceVersion = parsed.version || null;
 
-        // if DB has firmware for this device, notify
         const cfg = await DeviceConfig.findOne({ deviceId: ws.deviceId });
-        if (cfg && cfg.firmwareUrl) {
-          const otaMsg = { event: "ota", url: cfg.firmwareUrl, version: cfg.firmwareVersion || null, firmwareSha256: cfg.firmwareSha256 || null };
-          ws.send(JSON.stringify(otaMsg));
-          console.log(`Notified ${ws.deviceId} about firmware: ${cfg.firmwareUrl}`);
+        if (cfg && cfg.firmwareVersion && deviceVersion) {
+          if (cfg.firmwareVersion === deviceVersion) {
+            // Device has booted this firmware — clear assignment so server won't keep asking
+            cfg.firmwareUrl = "";
+            cfg.firmwareSha256 = "";
+            // optionally track appliedAt:
+            cfg.firmwareUploadedAt = cfg.firmwareUploadedAt || new Date();
+            await cfg.save();
+            console.log(`Cleared assigned firmware for ${ws.deviceId} (version ${deviceVersion})`);
+          }
         }
+
       }
     } catch (e) {
       // ignore non-json
