@@ -181,42 +181,70 @@ wss.on("connection", (ws, req) => {
 
   ws.on("message", async (raw) => {
     const message = raw.toString();
-    // try parse hello with deviceId
+
+    // Try parse hello with deviceId / version
+    let parsed;
     try {
-      const parsed = JSON.parse(message);
-      if (parsed.event === "hello" && parsed.deviceId) {
-        ws.deviceId = parsed.deviceId;
-        console.log("Registered ws.deviceId =", ws.deviceId);
-        const deviceVersion = parsed.version || null;
-
-        const cfg = await DeviceConfig.findOne({ deviceId: ws.deviceId });
-        if (cfg && cfg.firmwareVersion && deviceVersion) {
-          if (cfg.firmwareVersion === deviceVersion) {
-            // Device has booted this firmware — clear assignment so server won't keep asking
-            cfg.firmwareUrl = "";
-            cfg.firmwareSha256 = "";
-            // optionally track appliedAt:
-            cfg.firmwareUploadedAt = cfg.firmwareUploadedAt || new Date();
-            await cfg.save();
-            console.log(`Cleared assigned firmware for ${ws.deviceId} (version ${deviceVersion})`);
-          }
-        }
-
-      }
+      parsed = JSON.parse(message);
     } catch (e) {
-      // ignore non-json
+      // Not JSON – ignore or handle as plain text
+      return;
     }
 
-    // Example behavior: broadcast incoming messages to all clients
-    wss.clients.forEach((client) => {
-      if (client.readyState === client.OPEN) client.send(message);
-    });
+    try {
+      if (parsed.event === "hello" && parsed.deviceId) {
+        // Basic sanitization
+        const deviceId = String(parsed.deviceId).trim();
+        const deviceVersion = parsed.version ? String(parsed.version).trim() : null;
+
+        ws.deviceId = deviceId;
+        console.log("Registered ws.deviceId =", ws.deviceId, "version:", deviceVersion);
+
+        // Only attempt clearing if server has an assigned firmwareVersion for this device
+        const cfg = await DeviceConfig.findOne({ deviceId });
+        if (cfg && cfg.firmwareVersion && deviceVersion) {
+          // Compare versions (strict equality). Optionally compare SHA as well.
+          if (cfg.firmwareVersion === deviceVersion) {
+            // Atomically clear the assignment and mark appliedAt (safer)
+            const update = {
+              $set: { firmwareUrl: "", firmwareSha256: "" },
+              $unset: { /* nothing for now */ }
+            };
+            await DeviceConfig.findOneAndUpdate({ deviceId, firmwareVersion: cfg.firmwareVersion }, update);
+            console.log(`Cleared assigned firmware for ${deviceId} (version ${deviceVersion})`);
+
+            // Send explicit ack to device so it knows server recorded the applied version
+            const ack = { event: "ota_ack", deviceId, version: deviceVersion };
+            if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(ack));
+          }
+        }
+      }
+
+      // Optional: handle other events (cfg, ota_ack from device, etc.)
+      // Example: if device sends ota_ack you can also clear assignment here.
+
+      // If you still want to broadcast device telemetry/messages to other clients, do it explicitly:
+      if (parsed.event && parsed.event === "telemetry") {
+        const broadcastMsg = JSON.stringify(parsed); // or sanitize fields first
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === client.OPEN) client.send(broadcastMsg);
+        });
+      }
+
+    } catch (err) {
+      console.error("WS message handler error:", err);
+    }
   });
 
   ws.on("close", (code, reason) => {
     console.log(`Client disconnected (code ${code})`);
   });
+
+  ws.on("error", (err) => {
+    console.warn("WS client error:", err && err.message);
+  });
 });
+
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
