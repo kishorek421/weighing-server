@@ -56,6 +56,11 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50 MB limit
 });
 
+
+// ------ Create HTTP server and websocket server ------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
 // ------ Serve firmware files statically ------
 app.use("/firmwares", express.static(FIRMWARE_DIR, {
   // optional caching etc
@@ -172,9 +177,39 @@ app.post("/config/:deviceId/firmware", async (req, res) => {
   }
 });
 
-// ------ Create HTTP server and websocket server ------
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+// POST /api/reset-offset  { deviceId: "XYID-..." }
+app.post("/api/reset-offset", async (req, res) => {
+  try {
+    const { deviceId } = req.body;
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+
+    // Find the WS client for this deviceId
+    let found = false;
+    wss.clients.forEach((client) => {
+      try {
+        if (client.readyState === client.OPEN && client.deviceId === deviceId) {
+          // Send tare command
+          const cmd = { event: "cmd", cmd: "tare", ts: Date.now() };
+          client.send(JSON.stringify(cmd));
+          found = true;
+        }
+      } catch (e) {
+        console.warn("Failed sending tare to client", e && e.message);
+      }
+    });
+
+    if (!found) {
+      return res.status(404).json({ error: "Device not connected" });
+    }
+
+    // return success (device should respond via WS ack; front-end can poll or show toast)
+    return res.json({ ok: true, message: "Tare command sent" });
+  } catch (err) {
+    console.error("Error in /api/reset-offset:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 
 wss.on("connection", (ws, req) => {
   console.log("New WS client");
